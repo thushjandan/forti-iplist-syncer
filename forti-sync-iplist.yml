@@ -1,0 +1,76 @@
+---
+- name: Sync IP list with Fortigate Address group
+  hosts: all
+  connection: httpapi
+  collections:
+    - fortinet.fortios
+  vars:
+    forti_token: "{{ lookup('env','FORTI_TOKEN') }}"
+    forti_addrgrp_name: "PlexCloud"
+    forti_address_name_prefix: "Plex_"
+    forti_address_comment: "Plex Cloud servers"
+    ip_list_url: "https://s3-eu-west-1.amazonaws.com/plex-sidekiq-servers-list/sidekiqIPs.txt"
+    ansible_httpapi_port: 4443
+    ansible_httpapi_validate_certs: no
+    ansible_httpapi_use_ssl: yes
+    ansible_network_os: fortinet.fortios.fortios
+    ansible_python_interpreter: /usr/bin/env python3
+  tasks:
+    - name: Download list
+      uri:
+        url: "{{ ip_list_url }}"
+        return_content: true
+      register: resp
+      delegate_to: localhost
+
+    - name: Transform response payload to list
+      set_fact:
+        ip_list: "{{ resp.content.splitlines() }}"
+
+    - name: transform list to a itemlist
+      set_fact:
+        ip_dict_list: "{{ ip_dict_list|default([]) + [{'name': forti_address_name_prefix + item}] }}"
+      loop: "{{ ip_list }}"
+
+    - name: Create firewall address
+      fortios_firewall_address:
+        state: "present"
+        access_token: "{{ forti_token }}"
+        firewall_address:
+          type: "ipmask"
+          name: "{{ forti_address_name_prefix }}{{ item }}"
+          subnet: "{{ item }}/32"
+          comment: "{{ forti_address_comment }}"
+      loop: "{{ ip_list }}"
+
+    - name: Configure firewall group
+      fortios_firewall_addrgrp:
+        state: "present"
+        access_token: "{{ forti_token }}"
+        firewall_addrgrp:
+          name: "{{ forti_addrgrp_name }}"
+          comment: "Source: {{ ip_list_url }}"
+          member: "{{ ip_dict_list }}"
+
+    - name: Retrieve all addresses
+      fortinet.fortios.fortios_configuration_fact:
+        selector: firewall_address
+        filters:
+          - "name=@{{ forti_address_name_prefix }}"
+        access_token: "{{ forti_token }}"
+      register: forti_addresses_resp
+
+    - name: Filter out orphaned items
+      set_fact:
+        forti_orphan_addresses: "{{ forti_addresses_resp.meta.results | map(attribute='name') | reject('in', latest_ip_list_with_prefix) }}"
+      vars:
+        latest_ip_list_with_prefix: "{{ [forti_address_name_prefix] | product(ip_list) | map('join') | list }}"
+
+    - name: Remove orphan firewall addresses
+      fortios_firewall_address:
+        state: "absent"
+        access_token: "{{ forti_token }}"
+        firewall_address:
+          name: "{{ item }}"
+      loop: "{{ forti_orphan_addresses }}"
+      when: "forti_orphan_addresses"
